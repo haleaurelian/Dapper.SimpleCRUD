@@ -144,7 +144,7 @@ namespace Dapper
             if (whereprops.Any())
             {
                 sb.Append(" where ");
-                BuildWhere(sb, whereprops, (T)Activator.CreateInstance(typeof(T)));
+                BuildWhere(sb, whereprops, (T)Activator.CreateInstance(typeof(T)), whereConditions);
             }
 
             if (Debugger.IsAttached)
@@ -472,6 +472,42 @@ namespace Dapper
         /// <para>By default deletes records in the table matching the class name</para>
         /// <para>-Table name can be overridden by adding an attribute on your class [Table("YourTableName")]</para>
         /// <para>Deletes records where that match the where clause</para>
+        /// <para>whereConditions is an anonymous type to filter the results ex: new {Category = 1, SubCategory=2}</para>
+        /// <para>The number of records effected</para>
+        /// <para>Supports transaction and command timeout</para>
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="connection"></param>
+        /// <param name="whereConditions"></param>
+        /// <param name="transaction"></param>
+        /// <param name="commandTimeout"></param>
+        /// <returns>The number of records effected</returns>
+        public static int DeleteList<T>(this IDbConnection connection, object whereConditions, IDbTransaction transaction = null, int? commandTimeout = null)
+        {
+       
+            var currenttype = typeof(T);
+            var name = GetTableName(currenttype);
+
+            var sb = new StringBuilder();
+            var whereprops = GetAllProperties(whereConditions).ToArray();
+            sb.AppendFormat("Delete from {0}", name);
+            if (whereprops.Any())
+            {
+                sb.Append(" where ");
+                BuildWhere(sb, whereprops, (T)Activator.CreateInstance(typeof(T)));
+            }
+
+            if (Debugger.IsAttached)
+                Trace.WriteLine(String.Format("DeleteList<{0}> {1}", currenttype, sb));
+
+            return connection.Execute(sb.ToString(), whereConditions, transaction, commandTimeout);
+        }
+
+        /// <summary>
+        /// <para>Deletes a list of records in the database</para>
+        /// <para>By default deletes records in the table matching the class name</para>
+        /// <para>-Table name can be overridden by adding an attribute on your class [Table("YourTableName")]</para>
+        /// <para>Deletes records where that match the where clause</para>
         /// <para>conditions is an SQL where clause ex: "where name='bob'"</para>
 
         /// <para>The number of records effected</para>
@@ -546,27 +582,33 @@ namespace Dapper
             }
         }
 
-        //build select clause based on list of properties
+        //build select clause based on list of properties skipping ones with the IgnoreSelect attribute
         private static void BuildSelect(StringBuilder sb, IEnumerable<PropertyInfo> props)
         {
             var propertyInfos = props as IList<PropertyInfo> ?? props.ToList();
+            var addedAny = false;
             for (var i = 0; i < propertyInfos.Count(); i++)
             {
+                if (propertyInfos.ElementAt(i).GetCustomAttributes(true).Any(attr => attr.GetType().Name == "IgnoreSelectAttribute")) continue;
+
+                if (addedAny)
+                    sb.Append(",");
                 sb.Append(GetColumnName(propertyInfos.ElementAt(i)));
                 //if there is a custom column name add an "as customcolumnname" to the item so it maps properly
                 if (propertyInfos.ElementAt(i).GetCustomAttributes(true).SingleOrDefault(attr => attr.GetType().Name == "ColumnAttribute") != null)
                     sb.Append(" as " + propertyInfos.ElementAt(i).Name);
-                if (i < propertyInfos.Count() - 1)
-                    sb.Append(",");
+                addedAny = true;
+
             }
         }
 
-        //build where clause based on list of properties
-        private static void BuildWhere(StringBuilder sb, IEnumerable<PropertyInfo> idProps, object sourceEntity)
+        private static void BuildWhere(StringBuilder sb, IEnumerable<PropertyInfo> idProps, object sourceEntity, object whereConditions = null)
         {
             var propertyInfos = idProps.ToArray();
             for (var i = 0; i < propertyInfos.Count(); i++)
             {
+                var useIsNull = false;
+
                 //match up generic properties to source entity properties to allow fetching of the column attribute
                 //the anonymous object used for search doesn't have the custom attributes attached to them so this allows us to build the correct where clause
                 //by converting the model type to the database column name via the column attribute
@@ -577,17 +619,29 @@ namespace Dapper
                     if (sourceProperties.ElementAt(x).Name == propertyInfos.ElementAt(i).Name)
                     {
                         propertyToUse = sourceProperties.ElementAt(x);
+
+                        if (whereConditions != null && propertyInfos.ElementAt(i).CanRead && (propertyInfos.ElementAt(i).GetValue(whereConditions, null) == null || propertyInfos.ElementAt(i).GetValue(whereConditions, null) == DBNull.Value))
+                        {
+                            useIsNull = true;
+                        }
+                        break;
                     }
                 }
+                sb.AppendFormat(
+                    useIsNull ? "{0} is null" : "{0} = @{1}",
+                    GetColumnName(propertyToUse),
+                    propertyInfos.ElementAt(i).Name);
 
-                sb.AppendFormat("{0} = @{1}", GetColumnName(propertyToUse), propertyInfos.ElementAt(i).Name);
                 if (i < propertyInfos.Count() - 1)
                     sb.AppendFormat(" and ");
             }
         }
 
-        //build insert values which include all properties in the class that are not marked with the Editable(false) attribute,
-        //are not marked with the [Key] attribute, and are not named Id
+        //build insert values which include all properties in the class that are:
+        //Not named Id
+        //Not marked with the Editable(false) attribute
+        //Not marked with the [Key] attribute (without required attribute)
+        //Not marked with [IgnoreInsert]
         private static void BuildInsertValues(object entityToInsert, StringBuilder sb)
         {
             var props = GetScaffoldableProperties(entityToInsert).ToArray();
@@ -598,6 +652,7 @@ namespace Dapper
                     && property.GetCustomAttributes(true).Any(attr => attr.GetType().Name == "KeyAttribute")
                     && property.GetCustomAttributes(true).All(attr => attr.GetType().Name != "RequiredAttribute"))
                     continue;
+                if (property.GetCustomAttributes(true).Any(attr => attr.GetType().Name == "IgnoreInsertAttribute")) continue;
                 if (property.GetCustomAttributes(true).Any(attr => attr.GetType().Name == "ReadOnlyAttribute" && IsReadOnly(property))) continue;
 
                 if (property.Name == "Id" && property.GetCustomAttributes(true).All(attr => attr.GetType().Name != "RequiredAttribute") && property.PropertyType != typeof(Guid)) continue;
@@ -610,8 +665,11 @@ namespace Dapper
 
         }
 
-        //build insert parameters which include all properties in the class that are not marked with the Editable(false) attribute,
-        //are not marked with the [Key] attribute, and are not named Id
+        //build insert parameters which include all properties in the class that are not:
+        //marked with the Editable(false) attribute
+        //marked with the [Key] attribute
+        //marked with [IgnoreInsert]
+        //named Id
         private static void BuildInsertParameters(object entityToInsert, StringBuilder sb)
         {
             var props = GetScaffoldableProperties(entityToInsert).ToArray();
@@ -623,6 +681,8 @@ namespace Dapper
                     && property.GetCustomAttributes(true).Any(attr => attr.GetType().Name == "KeyAttribute")
                     && property.GetCustomAttributes(true).All(attr => attr.GetType().Name != "RequiredAttribute"))
                     continue;
+                if (property.GetCustomAttributes(true).Any(attr => attr.GetType().Name == "IgnoreInsertAttribute")) continue;
+
                 if (property.GetCustomAttributes(true).Any(attr => attr.GetType().Name == "ReadOnlyAttribute" && IsReadOnly(property))) continue;
                 if (property.Name == "Id" && property.GetCustomAttributes(true).All(attr => attr.GetType().Name != "RequiredAttribute") && property.PropertyType != typeof(Guid)) continue;
                 sb.Append(GetColumnName(property));
@@ -682,7 +742,11 @@ namespace Dapper
             return false;
         }
 
-        //Get all properties that are NOT named Id, DO NOT have the Key attribute, and are not marked ReadOnly
+        //Get all properties that are:
+        //Not named Id
+        //Not marked with the Key attribute
+        //Not marked ReadOnly
+        //Not marked IgnoreInsert
         private static IEnumerable<PropertyInfo> GetUpdateableProperties(object entity)
         {
             var updateableProperties = GetScaffoldableProperties(entity);
@@ -692,6 +756,8 @@ namespace Dapper
             updateableProperties = updateableProperties.Where(p => p.GetCustomAttributes(true).Any(attr => attr.GetType().Name == "KeyAttribute") == false);
             //remove ones that are readonly
             updateableProperties = updateableProperties.Where(p => p.GetCustomAttributes(true).Any(attr => (attr.GetType().Name == "ReadOnlyAttribute") && IsReadOnly(p)) == false);
+            //remove ones with IgnoreUpdate attribute
+            updateableProperties = updateableProperties.Where(p => p.GetCustomAttributes(true).Any(attr => attr.GetType().Name == "IgnoreUpdateAttribute") == false);
 
             return updateableProperties;
         }
@@ -907,6 +973,33 @@ namespace Dapper
         /// Does this property persist to the database?
         /// </summary>
         public bool IsReadOnly { get; private set; }
+    }
+
+    /// <summary>
+    /// Optional IgnoreSelect attribute.
+    /// Custom for Dapper.SimpleCRUD to exclude a property from Select methods
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Property)]
+    public class IgnoreSelectAttribute : Attribute
+    {
+    }
+
+    /// <summary>
+    /// Optional IgnoreInsert attribute.
+    /// Custom for Dapper.SimpleCRUD to exclude a property from Insert methods
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Property)]
+    public class IgnoreInsertAttribute : Attribute
+    {
+    }
+
+    /// <summary>
+    /// Optional IgnoreUpdate attribute.
+    /// Custom for Dapper.SimpleCRUD to exclude a property from Update methods
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Property)]
+    public class IgnoreUpdateAttribute : Attribute
+    {
     }
 
 }

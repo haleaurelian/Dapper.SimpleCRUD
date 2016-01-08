@@ -9,7 +9,6 @@ using System;
 using MySql.Data.MySqlClient;
 using Npgsql;
 
-
 namespace Dapper.SimpleCRUDTests
 {
     #region DTOClasses
@@ -111,7 +110,22 @@ namespace Dapper.SimpleCRUDTests
         public string StrangeWord { get; set; }
         [Editable(false)]
         public string ExtraProperty { get; set; }
+    }
 
+    public class IgnoreColumns
+    {
+        [Key]
+        public int Id { get; set; }
+        [IgnoreInsert]
+        public string IgnoreInsert { get; set; }
+        [IgnoreUpdate]
+        public string IgnoreUpdate { get; set; }
+        [IgnoreSelect]
+        public string IgnoreSelect { get; set; }
+        [IgnoreInsert]
+        [IgnoreUpdate]
+        [IgnoreSelect]
+        public string IgnoreAll { get; set; }
     }
 
     public class UserWithoutAutoIdentity
@@ -321,9 +335,6 @@ namespace Dapper.SimpleCRUDTests
                 connection.Execute("Delete from Users");
             }
         }
-
-
-
 
         public void InsertWithSpecifiedKey()
         {
@@ -631,7 +642,6 @@ namespace Dapper.SimpleCRUDTests
             }
         }
 
-
         //column attribute tests
 
         public void InsertWithSpecifiedColumnName()
@@ -699,7 +709,6 @@ namespace Dapper.SimpleCRUDTests
             }
         }
 
-
         public void TestGetListPaged()
         {
             using (var connection = GetOpenConnection())
@@ -718,6 +727,23 @@ namespace Dapper.SimpleCRUDTests
             }
         }
 
+        public void TestGetListPagedWithSpecifiedPrimaryKey()
+        {
+            using (var connection = GetOpenConnection())
+            {
+                int x = 0;
+                do
+                {
+                    connection.Insert(new StrangeColumnNames { Word = "Word " + x, StrangeWord = "Strange " + x });
+                    x++;
+                } while (x < 30);
+
+                var resultlist = connection.GetListPaged<StrangeColumnNames>(2, 10, null, null);
+                resultlist.Count().IsEqualTo(10);
+                resultlist.Skip(4).First().Word.IsEqualTo("Word 14");
+                connection.Execute("Delete from StrangeColumnNames");
+            }
+        }
         public void TestGetListPagedWithWhereClause()
         {
             using (var connection = GetOpenConnection())
@@ -740,7 +766,7 @@ namespace Dapper.SimpleCRUDTests
             }
         }
 
-        public void TestDeleteList()
+        public void TestDeleteListWithWhereClause()
         {
             using (var connection = GetOpenConnection())
             {
@@ -754,6 +780,24 @@ namespace Dapper.SimpleCRUDTests
                 connection.DeleteList<User>("Where age > 9");
                 var resultlist = connection.GetList<User>();
                 resultlist.Count().IsEqualTo(10);
+                connection.Execute("Delete from Users");
+            }
+        }
+
+        public void TestDeleteListWithWhereObject()
+        {
+            using (var connection = GetOpenConnection())
+            {
+                int x = 0;
+                do
+                {
+                    connection.Insert(new User { Name = "Person " + x, Age = x, CreatedDate = DateTime.Now, ScheduledDayOff = DayOfWeek.Thursday });
+                    x++;
+                } while (x < 10);
+
+                connection.DeleteList<User>(new {age = 9});
+                var resultlist = connection.GetList<User>();
+                resultlist.Count().IsEqualTo(9);
                 connection.Execute("Delete from Users");
             }
         }
@@ -803,6 +847,60 @@ namespace Dapper.SimpleCRUDTests
                 var user = connection.GetAsync<UserWithoutAutoIdentity>(999);
                 user.Result.Name.IsEqualTo("User999Async");
                 connection.Execute("Delete from UserWithoutAutoIdentity");
+            }
+        }
+
+
+        public void TestGetListNullableWhere()
+        {
+            using (var connection = GetOpenConnection())
+            {
+                connection.Insert(new User { Name = "TestGetListWithoutWhere", Age = 10, ScheduledDayOff = DayOfWeek.Friday });
+                connection.Insert(new User { Name = "TestGetListWithoutWhere", Age = 10 });
+
+                //test with null property
+                var list = connection.GetList<User>(new { ScheduledDayOff = (DayOfWeek?)null });
+                list.Count().IsEqualTo(1);
+
+
+                // test with db.null value
+                list = connection.GetList<User>(new { ScheduledDayOff = DBNull.Value });
+                list.Count().IsEqualTo(1);
+
+                connection.Execute("Delete from Users");
+            }
+        }
+        //ignore attribute tests
+        //i cheated here and stuffed all of these in one test
+        //didn't implement in postgres or mysql tests yet
+        public void IgnoreProperties()
+        {
+            using (var connection = GetOpenConnection())
+            {
+                var itemId = connection.Insert(new IgnoreColumns() { IgnoreInsert = "OriginalInsert", IgnoreUpdate = "OriginalUpdate", IgnoreSelect = "OriginalSelect", IgnoreAll = "OriginalAll" });
+                var item = connection.Get<IgnoreColumns>(itemId);
+                //verify insert column was ignored
+                item.IgnoreInsert.IsNull(); 
+
+                //verify select value wasn't selected 
+                item.IgnoreSelect.IsNull();
+
+                //verify the column is really there via straight dapper
+                var fromDapper = connection.Query<IgnoreColumns>("Select * from IgnoreColumns where Id = @Id", new{id = itemId}).First();
+                fromDapper.IgnoreSelect.IsEqualTo("OriginalSelect");
+               
+                //change value and update
+                item.IgnoreUpdate = "ChangedUpdate";
+                connection.Update(item);
+                
+                //verify that update didn't take effect
+                item = connection.Get<IgnoreColumns>(itemId);
+                item.IgnoreUpdate.IsEqualTo("OriginalUpdate");
+
+                var allColumnDapper = connection.Query<IgnoreColumns>("Select IgnoreAll from IgnoreColumns where Id = @Id", new { id = itemId }).First();
+                allColumnDapper.IgnoreAll.IsNull();
+
+                connection.Delete<IgnoreColumns>(itemId);
             }
         }
 
